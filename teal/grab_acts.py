@@ -1,7 +1,7 @@
 # CALIBRATION SCRIPT: Layer-by-layer activations collect karo aur histograms save karo.
 # Yeh script ek baar offline chalti hai. Iska output (histograms + activations) baad mein
 # threshold calculate karne (ppl_test.py) aur greedy optimization (greedyopt.py) ke liye use hota hai.
-
+# git commit -m "Added storing of output activations (y1, y2,....y7)" && git push -u origin main
 
 import argparse
 import os

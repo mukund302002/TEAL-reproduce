@@ -41,11 +41,23 @@ def _mlp_forward(self, x, activation_module=None):
         assert 1 == 0, "Pretraining TP > 1 not implemented yet"
     else:
         if self.grabbing_mode:
+            # h1: input to gate_proj and up_proj
             self.activation_module.grab_activations(x, 'h1')
 
-            intermediate_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            # y5, y6: outputs of gate_proj and up_proj (before act_fn and multiply)
+            gate_out = self.gate_proj(x)
+            self.activation_module.grab_activations(gate_out, 'y5')
+
+            up_out = self.up_proj(x)
+            self.activation_module.grab_activations(up_out, 'y6')
+
+            # h2: intermediate = act_fn(gate) * up — input to down_proj
+            intermediate_states = self.act_fn(gate_out) * up_out
             self.activation_module.grab_activations(intermediate_states, 'h2')
+
+            # y7: output of down_proj — final MLP output
             down_proj = self.down_proj(intermediate_states)
+            self.activation_module.grab_activations(down_proj, 'y7')
         else:
             x_gate = self.sparse_fns['gate'](x)
             x_up = self.sparse_fns['up'](x)

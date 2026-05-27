@@ -68,10 +68,18 @@ def _FA2_forward(
     # MONKEYPATCH HERE
     
     if self.grabbing_mode:
+        # h1: input to all three projections q, k, v
         self.activation_module.grab_activations(hidden_states, 'h1')
+
+        # y2, y1, y3: outputs of q, k, v projections
         query_states = self.q_proj(hidden_states)
+        self.activation_module.grab_activations(query_states, 'y2')
+
         key_states = self.k_proj(hidden_states)
+        self.activation_module.grab_activations(key_states, 'y1')
+
         value_states = self.v_proj(hidden_states)
+        self.activation_module.grab_activations(value_states, 'y3')
 
     else: 
         x_q = self.sparse_fns['q'](hidden_states)
@@ -144,8 +152,12 @@ def _FA2_forward(
 
     # MONKEYPATCH HERE
     if self.grabbing_mode:
+        # h2: input to o_proj (flash attention ka output)
         self.activation_module.grab_activations(attn_output, 'h2')
+
+        # y4: output of o_proj — final attention output
         attn_output = self.o_proj(attn_output)
+        self.activation_module.grab_activations(attn_output, 'y4')
     else:
         attn_output = self.sparse_fns['o'](attn_output)
         attn_output = self.o_proj(attn_output)
