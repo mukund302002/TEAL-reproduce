@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.whl
+models/
+*.egg-info/
+.env

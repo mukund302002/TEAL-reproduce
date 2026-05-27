@@ -7,50 +7,133 @@ from collections import defaultdict
 import os
 
 class SparsifyFn(nn.Module):
-    def __init__(self, distr, init_sparsity=None,init_threshold=None, apply_prefill=True):
+    """
+    TEAL ka core sparsification module.
+
+    Har projection (q, k, v, o, gate, up, down) ke liye ek SparsifyFn object banta hai.
+    Yeh module input tensor ke chhote magnitude values ko zero kar deta hai.
+
+    Kaam kaise karta hai:
+      - Ek threshold store karta hai (histogram se calculate hua)
+      - Forward pass mein: |x| < threshold wale values → 0
+      - ~sparsity% values zero ho jaati hain
+
+    Do modes:
+      - Prefill (seq_len > 1): sirf last 50% tokens pe sparsity apply hoti hai
+      - Decode  (seq_len = 1): poore token pe sparsity apply hoti hai
+    """
+
+    def __init__(self, distr, init_sparsity=None, init_threshold=None, apply_prefill=True):
+        """
+        Args:
+            distr:            Distribution object — histogram load kiya hua hai isme
+                              (icdf() se threshold milta hai)
+            init_sparsity:    agar shuru mein hi koi sparsity set karni ho (0 to 1)
+            init_threshold:   agar seedha threshold value deni ho
+            apply_prefill:    True → prefill mein bhi sparsity lagao (last 50% tokens pe)
+                              False → prefill mein koi sparsity nahi
+        """
         super(SparsifyFn, self).__init__()
 
+        # Dono ek saath specify nahi ho sakte
         assert init_sparsity is None or init_threshold is None, "init_sparsity and init_threshold cannot both be specified"
 
         if init_sparsity is not None:
+            # Sparsity se threshold nikalo:
+            # sparsity=0.5 → q = 0.5 + 0.5/2 = 0.75 → icdf(0.75) = 75th percentile
             thresh = distr.icdf(0.5 + init_sparsity/2)
         elif init_threshold is not None:
+            # Seedha threshold diya gaya
             thresh = init_threshold
         else:
+            # Default: koi sparsity nahi (threshold=0 matlab koi zeroing nahi)
             init_sparsity = 0
             thresh = 0
-        
+
+        # Threshold ko model buffer ke roop mein register karo (fp16 mein)
+        # register_buffer: yeh tensor model ke saath save/load hota hai
+        # lekin gradient calculate nahi hota (trainable nahi hai)
         self.register_buffer("a", torch.tensor([thresh]).to(torch.float16))
 
-        self.distr = distr
+        self.distr = distr          # Distribution object (histogram ke saath)
         self.apply_prefill = apply_prefill
 
     def set_threshold(self, sparsity):
+        """
+        Naya sparsity level set karo — threshold histogram se calculate hoga.
+
+        Formula: threshold = icdf(0.5 + sparsity/2)
+          sparsity=0.0 → threshold=0   (koi zeroing nahi, dense)
+          sparsity=0.5 → icdf(0.75)   = 75th percentile value
+          sparsity=0.8 → icdf(0.90)   = 90th percentile value
+
+        Intuition: activations symmetric hain 0 ke around.
+          75th percentile = woh value jiske neeche 75% values hain
+          = absolute value ka 50th percentile
+          = ~50% values zero ho jaayengi
+        """
         self.threshold = self.distr.icdf(0.5 + sparsity/2).item() if sparsity != 0.0 else 0.0
         self.sparsity_level = sparsity
 
     def forward(self, x):
+        """
+        Input tensor x pe sparsity apply karo.
 
-        # NOTE: we can + should change this to sparsify 99% of tokens instead of 50%
-        # I just finished the evals for the paper at 50% before I noticed the prefill sparsification phenomenon (Section 5.4.3)
+        x shape: (batch_size, seq_len, hidden_dim)
+
+        Do cases:
+          seq_len > 1 → PREFILL phase (poora prompt ek saath)
+          seq_len = 1 → DECODE phase (ek token at a time)
+        """
+
+        # ── PREFILL phase (seq_len > 1) ──
         if x.size(1) > 1 and self.apply_prefill:
+            # Sirf last 50% tokens pe sparsity apply karo, pehle 50% dense rehte hain.
+            #
+            # Reason (paper Section 5.4.3):
+            #   Prefill ke pehle tokens context build karte hain — unhe sparse karna
+            #   accuracy hurt karta hai. Last tokens pe sparsity safe hai.
+            #
+            # NOTE (original author ka comment):
+            #   Ideally 99% tokens sparse karne chahiye (sirf 1% dense),
+            #   lekin paper ke evals 50% pe finish ho gaye the is finding se pehle.
+            #   half_seq_len = int(0.99 * x.size(1))  ← yeh better hoga future mein
             half_seq_len = x.size(1) // 2
-            # half_seq_len = int(0.99 * x.size(1))
-            last_context = x[:, -half_seq_len:, :]
-            modified_context = self.apply(last_context)
-            
+
+            last_context = x[:, -half_seq_len:, :]        # last 50% tokens
+            modified_context = self.apply(last_context)   # inpe sparsity lagao
+
+            # Pehla half unchanged + sparse last half → wapas jodo
             x = torch.cat((x[:, :-half_seq_len, :], modified_context), dim=1)
             return x
-        
+
+        # ── PREFILL phase lekin apply_prefill=False ──
+        # Prefill pe koi sparsity nahi chahiye → x as-is return karo
         if x.size(1) > 1 and not self.apply_prefill:
             return x
 
+        # ── DECODE phase (seq_len = 1) ──
+        # Ek token generate ho raha hai → poore token pe sparsity lagao
         assert x.size(1) == 1, "supposedly x is decode only"
         return self.apply(x)
 
     def apply(self, x):
+        """
+        Actual sparsification: threshold se chhote magnitude values zero karo.
+
+        x.abs()          → har value ka absolute value lo
+        .gt(self.threshold) → jo threshold se bade hain unhe True (1), baaki False (0)
+        * x              → mask multiply karo original x se
+
+        Example:
+          x         = [ 0.1, -0.5,  0.03,  0.8, -0.02]
+          threshold = 0.42
+          mask      = [False, True, False,  True, False]
+          output    = [ 0.0, -0.5,  0.0,   0.8,  0.0 ]
+          → 3 out of 5 values zero ho gaye = 60% sparsity
+        """
         return x.abs().gt(self.threshold) * x
-    
+
     def get_threshold(self):
         return self.threshold
 
@@ -222,7 +305,7 @@ def get_sparse_model(model_name, device, histogram_path, **kwargs):
 
 def get_tokenizer(tokenizer_name):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        tokenizer_name, use_fast=True, trust_remote_code=True
+        tokenizer_name, use_fast=False, trust_remote_code=True
     )
 
     if tokenizer.pad_token_id is None:
